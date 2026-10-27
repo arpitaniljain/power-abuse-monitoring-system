@@ -1,20 +1,40 @@
 import time
 import serial
 import RPi.GPIO as GPIO
+
 from RPLCD.i2c import CharLCD
 
-# ---------- CONFIGURATION ----------
+
+# ==============================
+# CONFIGURATION
+# ==============================
 
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 9600
 
-RELAY_PIN = 17       # BCM GPIO 17, physical pin 11
-BUZZER_PIN = 23      # BCM GPIO 23, physical pin 16
-BUTTON_PIN = 24      # BCM GPIO 24, physical pin 18
+VOLTAGE = 230.0
+POWER_LIMIT = 1500.0
 
-POWER_LIMIT = 1500   # Overload threshold in watts
+# Raspberry Pi BCM GPIO pin numbers
+RELAY_PIN = 17
+BUZZER_PIN = 23
+RESET_BUTTON_PIN = 24
 
-# ---------- GPIO SETUP ----------
+# Assumption: relay is active LOW.
+# LOW  = load powered
+# HIGH = load disconnected
+RELAY_ON = GPIO.LOW
+RELAY_OFF = GPIO.HIGH
+
+# LCD configuration
+LCD_ADDRESS = 0x27
+LCD_COLUMNS = 16
+LCD_ROWS = 2
+
+
+# ==============================
+# GPIO AND LCD INITIALIZATION
+# ==============================
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -22,138 +42,194 @@ GPIO.setwarnings(False)
 GPIO.setup(RELAY_PIN, GPIO.OUT)
 GPIO.setup(BUZZER_PIN, GPIO.OUT)
 GPIO.setup(
-    BUTTON_PIN,
+    RESET_BUTTON_PIN,
     GPIO.IN,
     pull_up_down=GPIO.PUD_UP
 )
 
-# Active-low relay:
-# LOW = relay energized; HIGH = relay de-energized.
-# Verify the actual relay module behavior before connecting a load.
-GPIO.output(RELAY_PIN, GPIO.LOW)
+# Start with the load enabled and buzzer off.
+GPIO.output(RELAY_PIN, RELAY_ON)
 GPIO.output(BUZZER_PIN, GPIO.LOW)
 
-# ---------- LCD SETUP ----------
-
-lcd = CharLCD(
-    "PCF8574",
-    address=0x27,
-    port=1,
-    cols=16,
-    rows=2
-)
-
-lcd.clear()
-lcd.write_string("Power Monitor")
-lcd.cursor_pos = (1, 0)
-lcd.write_string("Starting...")
-time.sleep(2)
-lcd.clear()
-
-# ---------- SERIAL SETUP ----------
-
+lcd = None
 ser = None
-system_locked = False
+
+
+# ==============================
+# HELPER FUNCTIONS
+# ==============================
+
+def display_message(line1, line2=""):
+    """Display two lines on the 16x2 LCD."""
+    lcd.clear()
+    lcd.cursor_pos = (0, 0)
+    lcd.write_string(line1[:LCD_COLUMNS])
+
+    lcd.cursor_pos = (1, 0)
+    lcd.write_string(line2[:LCD_COLUMNS])
+
+
+def disconnect_load():
+    """Disconnect the load and activate the buzzer."""
+    GPIO.output(RELAY_PIN, RELAY_OFF)
+    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+
+
+def reconnect_load():
+    """Reconnect the load and turn off the buzzer."""
+    GPIO.output(BUZZER_PIN, GPIO.LOW)
+    GPIO.output(RELAY_PIN, RELAY_ON)
+
+
+# ==============================
+# MAIN PROGRAM
+# ==============================
 
 try:
+    # Initialize serial communication with Arduino Nano.
     ser = serial.Serial(
         SERIAL_PORT,
         BAUD_RATE,
-        timeout=1
+        timeout=2
     )
 
+    # Allow the serial connection to stabilize.
     time.sleep(2)
-    print("SYSTEM STARTED")
 
-    # ---------- MAIN LOOP ----------
+    lcd = CharLCD(
+        i2c_expander="PCF8574",
+        address=LCD_ADDRESS,
+        port=1,
+        cols=LCD_COLUMNS,
+        rows=LCD_ROWS,
+        charmap="A00",
+        auto_linebreaks=False
+    )
+
+    display_message("Power Monitoring", "System Starting")
+    time.sleep(2)
+
+    overload = False
 
     while True:
+
+        # ------------------------------
+        # RESET BUTTON
+        # ------------------------------
+        # Button is assumed to connect GPIO24 to GND
+        # when pressed.
+        if GPIO.input(RESET_BUTTON_PIN) == GPIO.LOW:
+
+            if overload:
+                reconnect_load()
+                overload = False
+
+                display_message(
+                    "System Reset",
+                    "Load Restored"
+                )
+
+                time.sleep(1)
+
+            # Debounce the button.
+            while GPIO.input(RESET_BUTTON_PIN) == GPIO.LOW:
+                time.sleep(0.05)
+
+        # ------------------------------
+        # READ CURRENT FROM ARDUINO
+        # ------------------------------
+        line = ser.readline().decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+        if not line or line.startswith("#"):
+            continue
+
         try:
-            # Read: current,power
-            line = ser.readline().decode(
-                "utf-8",
-                errors="ignore"
-            ).strip()
+            current = float(line)
 
-            if line:
-                print("RAW:", line)
+        except ValueError:
+            # Ignore invalid or non-numeric serial data.
+            continue
 
-                parts = line.split(",")
+        # ------------------------------
+        # ESTIMATE POWER
+        # ------------------------------
+        # This assumes a fixed 230 V supply.
+        # It is an estimate, not a true AC real-power
+        # measurement.
+        power = current * VOLTAGE
 
-                if len(parts) != 2:
-                    continue
+        # ------------------------------
+        # OVERLOAD DETECTION
+        # ------------------------------
+        if power > POWER_LIMIT and not overload:
 
-                try:
-                    current = float(parts[0])
-                    power = float(parts[1])
-                except ValueError:
-                    continue
+            overload = True
+            disconnect_load()
 
-                # ---------- BUTTON RESET ----------
+            display_message(
+                "!! OVERLOAD !!",
+                "Power: {:.0f} W".format(power)
+            )
 
-                if GPIO.input(BUTTON_PIN) == GPIO.LOW:
-                    print("RESET PRESSED")
-                    system_locked = False
-                    time.sleep(0.3)
-
-                # ---------- OVERLOAD LOGIC ----------
-
-                if system_locked:
-                    status = "LOCKED"
-
-                    GPIO.output(RELAY_PIN, GPIO.HIGH)
-                    GPIO.output(BUZZER_PIN, GPIO.HIGH)
-
-                elif power > POWER_LIMIT:
-                    status = "OVERLOAD"
-                    system_locked = True
-
-                    GPIO.output(RELAY_PIN, GPIO.HIGH)
-                    GPIO.output(BUZZER_PIN, GPIO.HIGH)
-
-                else:
-                    status = "NORMAL"
-
-                    GPIO.output(RELAY_PIN, GPIO.LOW)
-                    GPIO.output(BUZZER_PIN, GPIO.LOW)
-
-                # ---------- LCD DISPLAY ----------
-
-                lcd.clear()
-                lcd.write_string(
-                    f"I={current:.2f}A"
+            print(
+                "OVERLOAD! Current: {:.2f} A, "
+                "Estimated Power: {:.2f} W".format(
+                    current, power
                 )
+            )
 
-                lcd.cursor_pos = (1, 0)
-                lcd.write_string(
-                    f"P={power:.0f}W {status}"[:16]
+            continue
+
+        # ------------------------------
+        # DISPLAY NORMAL READINGS
+        # ------------------------------
+        if not overload:
+
+            display_message(
+                "I:{:.2f} A".format(current),
+                "P:{:.0f} W".format(power)
+            )
+
+            print(
+                "Current: {:.2f} A | "
+                "Estimated Power: {:.2f} W".format(
+                    current, power
                 )
+            )
 
-                print(
-                    f"I={current:.2f} A | "
-                    f"P={power:.0f} W | {status}"
-                )
+        else:
+            # Keep the load disconnected until reset.
+            disconnect_load()
 
-                time.sleep(0.5)
+            display_message(
+                "!! OVERLOAD !!",
+                "Press Reset Btn"
+            )
 
-        except Exception as error:
-            print("Reading error:", error)
-            time.sleep(0.5)
+        time.sleep(0.1)
+
 
 except KeyboardInterrupt:
-    print("Program stopped by user.")
+    print("\nProgram stopped by user.")
 
 except Exception as error:
-    print("System error:", error)
+    print("Error:", error)
 
 finally:
+    # Turn off the buzzer and release GPIO resources.
+    GPIO.output(BUZZER_PIN, GPIO.LOW)
+    GPIO.cleanup()
+
     if ser is not None and ser.is_open:
         ser.close()
 
-    try:
-        lcd.clear()
-    except Exception:
-        pass
+    if lcd is not None:
+        try:
+            lcd.close(clear=True)
+        except Exception:
+            pass
 
-    GPIO.cleanup()
-    print("GPIO cleaned up.")
+    print("GPIO cleanup completed.")
