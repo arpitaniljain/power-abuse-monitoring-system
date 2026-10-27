@@ -67,6 +67,19 @@ The Raspberry Pi provides supervisory monitoring, while the LCD and buzzer provi
 
 ## 🚧 Future Improvements
 
+---
+
+## 📸 Hardware Prototype & Testing
+
+### Complete Hardware Setup
+![Power Abuse Monitoring System Prototype](power-abuse-system-prototype.jpeg)
+
+### Circuit and Connections
+![Power Abuse Monitoring System Circuit](power-abuse-circuit.jpeg)
+
+### Hardware Testing
+![Power Abuse Monitoring System Testing](power-abuse-testing.jpeg)
+
 - Improved measurement calibration and accuracy.
 - Data logging and historical power-consumption analysis.
 - IoT-based monitoring and notifications.
